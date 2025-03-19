@@ -4,8 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/alpacahq/alpaca-trade-api-go/v3/alpaca"
-	"github.com/alpacahq/alpaca-trade-api-go/v3/marketdata"
-	"github.com/coolFreight/fintech/equities"
+	"github.com/coolFreight/fintech/account"
 	"github.com/coolFreight/fintech/internal/client/pricing"
 	"golang.org/x/net/websocket"
 	"log"
@@ -34,39 +33,31 @@ const (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	prefix := "APCA_PAPER"
 
-	logger.Info("calling alpaca %s", os.Getenv("APCA_PAPER_ENDPOINT"))
+	if os.Getenv("APCA_ENVIRONMENT") == "prod" {
+		logger.Info("******* LIVE ENVIRONMENT ****************")
+		prefix = "APCA_LIVE"
+	} else {
+		logger.Info("******* PAPER ENVIRONMENT ****************")
+	}
+
+	logger.Info(fmt.Sprintf("calling alpaca %s", os.Getenv(prefix+"_BASE_URL")))
+
 	client := alpaca.NewClient(alpaca.ClientOpts{
 		// Alternatively you can set your Key and Secret using the
 		// APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables
-		APIKey:    os.Getenv("APCA_PAPER_API_KEY"),
-		APISecret: os.Getenv("APCA_PAPER_API_SECRET"),
-		BaseURL:   os.Getenv("APCA_PAPER_ENDPOINT"),
+		APIKey:    os.Getenv(prefix + "_API_KEY"),
+		APISecret: os.Getenv(prefix + "_API_SECRET"),
+		BaseURL:   os.Getenv("prefix" + "_BASE_URL"),
 	})
 
-	acct, err := client.GetAccount()
+	account := account.NewAccountService(client)
+	acct, err := account.GetAccount()
 	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("%+v\n", *acct)
-
-	marketClient := marketdata.NewClient(marketdata.ClientOpts{
-		APIKey:    os.Getenv("APCA_PAPER_API_KEY"),
-		APISecret: os.Getenv("APCA_PAPER_API_SECRET"),
-	})
-
-	service := equities.NewEquityService(marketClient, logger)
-	movingAverage, err := service.MovingAverage("YOU")
-
-	if err != nil {
-		fmt.Printf("%+v\n", err)
+		logger.Error("Could not retrieve account information", err)
 	} else {
-		fmt.Printf("Moving average is %f\n", movingAverage)
-	}
-
-	type Connect struct {
-		Action string   `json:"action"`
-		Trades []string `json:"trades"`
+		fmt.Printf("%+v\n", *acct)
 	}
 
 	type auth struct {
@@ -75,45 +66,56 @@ func main() {
 		Secret string `json:"secret"`
 	}
 
-	origin := "https://paper-api.alpaca.markets/v2"
-	url := "wss://stream.data.alpaca.markets/v2/test"
-	ws, err := websocket.Dial(url, "", origin)
+	count := 5
+	for count > 0 {
+		logger.Info("Starting to connect for pricing")
+		ws, err := startStream(prefix, logger)
 
-	if err != nil {
-		log.Fatal(err)
-	}
-	read(ws, logger)
-
-	fmt.Printf("Attempting to authenticate\n")
-
-	authenticate := auth{
-		Action: "auth",
-		Key:    os.Getenv("APCA_PAPER_API_KEY"),
-		Secret: os.Getenv("APCA_PAPER_API_SECRET"),
-	}
-	err = send(authenticate, ws, logger)
-	if err != nil {
-		log.Fatal("could not authenticate - ", err)
-	}
-	read(ws, logger)
-
-	fmt.Printf("Requesting pricing\n")
-	connect := Connect{Action: "subscribe", Trades: []string{"FAKEPACA"}}
-	err = send(connect, ws, logger)
-	read(ws, logger)
-	read(ws, logger)
-
-	var wg sync.WaitGroup
-	prices := pricing.NewPricing(ws, logger)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for quote := range prices {
-			fmt.Println(quote)
+		logger.Info("Attempting to authenticate")
+		authenticate := auth{
+			Action: "auth",
+			Key:    os.Getenv(prefix + "_API_KEY"),
+			Secret: os.Getenv(prefix + "_API_SECRET"),
 		}
-	}()
-	wg.Wait()
+		err = send(authenticate, ws, logger)
+		if err != nil {
+			log.Fatal("could not authenticate - ", err)
+		}
+		read(ws, logger)
+		//
+		fmt.Printf("Requesting trades\n")
+		connect := pricing.TradeConnect{Action: "subscribe", Trades: []string{"YOU", "AAPL", "TSLA", "ACHR"}}
+		err = send(connect, ws, logger)
+		read(ws, logger)
 
+		fmt.Printf("Requesting pricing\n")
+		quotes := pricing.PricingConnect{Action: "subscribe", Quotes: []string{"YOU", "AAPL", "TSLA", "ACHR", "FAKEPACA", "JOBY", "SPXL", "SPXS"}}
+		err = send(quotes, ws, logger)
+		read(ws, logger)
+
+		var wg sync.WaitGroup
+		trades := pricing.NewTrades(ws, logger)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for trade := range trades {
+				fmt.Println(trade)
+			}
+		}()
+
+		quotesPricing := pricing.NewQuotes(ws, logger)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for quote := range quotesPricing {
+				fmt.Println(quote)
+			}
+		}()
+		wg.Wait()
+		count--
+		logger.Info(fmt.Sprintf("Stream closed retrying %d", count))
+		time.Sleep(5 * time.Minute)
+	}
 	//autho := auth{Action: "auth", Key: os.Getenv("APCA_PAPER_API_KEY"), Secret: os.Getenv("APCA_PAPER_API_SECRET")}
 	//err = websocket.Message.Send(ws, autho)
 	//if err != nil {
@@ -218,4 +220,20 @@ func read(ws *websocket.Conn, logger *slog.Logger) {
 		logger.Error("Could not read data", err)
 	}
 	fmt.Printf("Received: %s.\n", msg[:n])
+}
+
+func startStream(prefix string, logger *slog.Logger) (*websocket.Conn, error) {
+	logger.Info("Starting websocket stream .......")
+	origin := os.Getenv(prefix+"_BASE_URL") + os.Getenv(prefix+"_API_VERSION")
+	url := os.Getenv(prefix + "_MARKET_STREAM")
+
+	ws, err := websocket.Dial(url, "", origin)
+	if err != nil {
+		log.Fatal(err)
+		return nil, err
+	}
+
+	read(ws, logger)
+
+	return ws, nil
 }
